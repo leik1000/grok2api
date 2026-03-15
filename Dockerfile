@@ -22,8 +22,8 @@ RUN apk add --no-cache \
 
 WORKDIR /app
 
-# 安装 uv
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+# 安装 uv（避免依赖 ghcr.io）
+RUN pip install --no-cache-dir uv
 
 COPY pyproject.toml uv.lock ./
 
