@@ -46,7 +46,7 @@ class VideoCreateRequest(BaseModel):
     size: Optional[str] = Field("1792x1024", description="Output size")
     seconds: Optional[int] = Field(6, description="Video length in seconds")
     quality: Optional[str] = Field("standard", description="Quality: standard/high")
-    image_reference: Optional[Any] = Field(None, description="Structured image reference")
+    image_reference: Optional[Any] = Field(None, description="Image reference(s) using chat/completions content-block format: a single or array of {type:'image_url', image_url:{url:'...'}}, or plain URL strings")
     input_reference: Optional[Any] = Field(None, description="Multipart input reference file")
 
 
@@ -165,58 +165,103 @@ def _validate_reference_value(value: str, param: str) -> str:
     )
 
 
-def _parse_image_reference(value: Any) -> Optional[str]:
-    if value is None or value == "":
-        return None
+def _parse_single_image_ref(value: Any, idx: Optional[int] = None) -> str:
+    """Parse a single image reference item using the same format as chat/completions.
 
+    Supported formats (same as messages[].content blocks):
+      - str: plain URL or data-URI
+      - {"type": "image_url", "image_url": {"url": "..."}}
+    """
+    param_prefix = f"image_reference[{idx}]" if idx is not None else "image_reference"
+
+    # Plain URL string
     if isinstance(value, str):
         stripped = value.strip()
         if not stripped:
-            return None
-        if stripped[0] in {"{", "["}:
+            raise ValidationException(
+                message=f"{param_prefix} cannot be empty",
+                param=param_prefix,
+                code="invalid_reference",
+            )
+        return _validate_reference_value(stripped, param_prefix)
+
+    # Content block: {"type": "image_url", "image_url": {"url": "..."}}
+    if isinstance(value, dict):
+        block_type = value.get("type")
+        if block_type != "image_url":
+            raise ValidationException(
+                message=f'{param_prefix} must have type="image_url"',
+                param=f"{param_prefix}.type",
+                code="invalid_reference",
+            )
+        inner = value.get("image_url")
+        if not isinstance(inner, dict):
+            raise ValidationException(
+                message=f"{param_prefix}.image_url must be an object with a url field",
+                param=f"{param_prefix}.image_url",
+                code="invalid_reference",
+            )
+        url = inner.get("url", "")
+        if not isinstance(url, str) or not url.strip():
+            raise ValidationException(
+                message=f"{param_prefix}.image_url.url cannot be empty",
+                param=f"{param_prefix}.image_url.url",
+                code="invalid_reference",
+            )
+        return _validate_reference_value(url.strip(), f"{param_prefix}.image_url.url")
+
+    raise ValidationException(
+        message=(
+            f'{param_prefix} must be a URL string or '
+            f'{{"type": "image_url", "image_url": {{"url": "..."}}}}'
+        ),
+        param=param_prefix,
+        code="invalid_reference",
+    )
+
+
+def _parse_image_references(value: Any) -> List[str]:
+    """Parse image_reference into a list of validated URL strings.
+
+    Uses the same content-block format as chat/completions.
+    Accepts:
+      - None / ""  -> []
+      - "https://..." -> [url]
+      - {"type": "image_url", "image_url": {"url": "..."}} -> [url]
+      - ["url", {"type": "image_url", ...}, ...] -> [url, ...]
+      - JSON string of any of the above (for multipart/form-data)
+    """
+    if value is None or value == "":
+        return []
+
+    # Multipart form-data sends JSON as a string; deserialise first
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        if stripped[0] in ("{", "["):
             try:
                 value = orjson.loads(stripped)
             except orjson.JSONDecodeError:
-                # allow plain url/data-uri in multipart text field as a practical fallback
-                return _validate_reference_value(stripped, "image_reference")
+                return [_validate_reference_value(stripped, "image_reference")]
         else:
-            return _validate_reference_value(stripped, "image_reference")
+            return [_validate_reference_value(stripped, "image_reference")]
 
-    if not isinstance(value, dict):
-        raise ValidationException(
-            message=(
-                "image_reference must be an object with exactly one of "
-                "`image_url` or `file_id`"
-            ),
-            param="image_reference",
-            code="invalid_reference",
-        )
+    # Single content block
+    if isinstance(value, dict):
+        return [_parse_single_image_ref(value)]
 
-    image_url = value.get("image_url")
-    file_id = value.get("file_id")
-    image_url = image_url.strip() if isinstance(image_url, str) else ""
-    file_id = file_id.strip() if isinstance(file_id, str) else ""
+    # Array of content blocks
+    if isinstance(value, list):
+        if not value:
+            return []
+        return [_parse_single_image_ref(item, idx=i) for i, item in enumerate(value)]
 
-    has_image_url = bool(image_url)
-    has_file_id = bool(file_id)
-    if has_image_url == has_file_id:
-        raise ValidationException(
-            message="image_reference requires exactly one of image_url or file_id",
-            param="image_reference",
-            code="invalid_reference",
-        )
-
-    if has_file_id:
-        raise ValidationException(
-            message=(
-                "image_reference.file_id is not supported in current reverse pipeline; "
-                "please use image_reference.image_url or multipart input_reference"
-            ),
-            param="image_reference.file_id",
-            code="unsupported_reference",
-        )
-
-    return _validate_reference_value(image_url, "image_reference.image_url")
+    raise ValidationException(
+        message="image_reference must be a URL string, a content block, or an array",
+        param="image_reference",
+        code="invalid_reference",
+    )
 
 
 async def _upload_to_data_uri(file: UploadFile, param: str) -> str:
@@ -234,9 +279,8 @@ async def _upload_to_data_uri(file: UploadFile, param: str) -> str:
 
 async def _build_references_for_json(payload: BaseModel) -> List[str]:
     references: List[str] = []
-    parsed_image_ref = _parse_image_reference(getattr(payload, "image_reference", None))
-    if parsed_image_ref:
-        references.append(parsed_image_ref)
+    parsed_refs = _parse_image_references(getattr(payload, "image_reference", None))
+    references.extend(parsed_refs)
     if getattr(payload, "input_reference", None) not in (None, ""):
         raise ValidationException(
             message="input_reference must be uploaded as multipart/form-data file",
@@ -282,9 +326,8 @@ async def _build_payload_and_references_for_form(
             code="invalid_reference",
         )
 
-    parsed_image_ref = _parse_image_reference(payload.image_reference)
-    if parsed_image_ref:
-        references.append(parsed_image_ref)
+    parsed_refs = _parse_image_references(payload.image_reference)
+    references.extend(parsed_refs)
     return payload, references
 
 
